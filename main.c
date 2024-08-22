@@ -27,6 +27,7 @@
 #include "ble_advdata.h"
 #include "ble_advertising.h"
 #include "ble_conn_params.h"
+#include "ble_conn_state.h"
 #include "nrf_sdh.h"
 #include "nrf_sdh_soc.h"
 #include "nrf_sdh_ble.h"
@@ -143,6 +144,7 @@ static pm_peer_id_t m_peer_to_be_deleted = PM_PEER_ID_INVALID;
 
 #define PACKET_VESC						0
 #define PACKET_BLE						1
+#define PACKET_HC						2
 
 #define LED_ON()						nrf_gpio_pin_set(LED_PIN)
 #define LED_OFF()						nrf_gpio_pin_clear(LED_PIN)
@@ -209,10 +211,9 @@ APP_TIMER_DEF(m_nrf_timer);
 
 BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
-NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
+NRF_BLE_QWRS_DEF(m_qwr, NRF_SDH_BLE_TOTAL_LINK_COUNT);                              /**< Context for the Queued Write module.*/
 BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
 
-static uint16_t   m_conn_handle          = BLE_CONN_HANDLE_INVALID;                 /**< Handle of the current connection. */
 static uint16_t   m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;            /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
 static ble_uuid_t m_adv_uuids[]          =                                          /**< Universally unique service identifier. */
 {
@@ -431,7 +432,8 @@ static void nrf_qwr_error_handler(uint32_t nrf_error) {
 static void nus_data_handler(ble_nus_evt_t * p_evt) {
 	if (p_evt->type == BLE_NUS_EVT_RX_DATA) {
 		for (uint32_t i = 0; i < p_evt->params.rx_data.length; i++) {
-			packet_process_byte(p_evt->params.rx_data.p_data[i], PACKET_BLE);
+			/* TODO: Connection tracking + get handle from p_evt. */
+			packet_process_byte(p_evt->params.rx_data.p_data[i], conn_handle);
 		}
 	}
 }
@@ -442,7 +444,9 @@ static void services_init(void) {
 
 	// Initialize Queued Write Module.
 	qwr_init.error_handler = nrf_qwr_error_handler;
-	nrf_ble_qwr_init(&m_qwr, &qwr_init);
+	for (int i = 0; i < NRF_SDH_BLE_TOTAL_LINK_COUNT; i++) {
+		APP_ERROR_CHECK(nrf_ble_qwr_init(&m_qwr[i], &qwr_init));
+	}
 
 	// Initialize NUS.
 	memset(&nus_init, 0, sizeof(nus_init));
@@ -693,7 +697,7 @@ void rfhelp_send_data_crc(uint8_t *data, unsigned int len) {
 	esb_timeslot_set_next_packet(buffer, len + 2);
 }
 
-static void ble_send_buffer(unsigned char *data, unsigned int len) {
+static void ble_hc_send_buffer(unsigned char *data, unsigned int len, uint16_t conn_handle) {
 	if (m_conn_handle != BLE_CONN_HANDLE_INVALID) {
 		uint32_t err_code = NRF_SUCCESS;
 		int ind = 0;
@@ -715,8 +719,17 @@ static void ble_send_buffer(unsigned char *data, unsigned int len) {
 		}
 	}
 }
+static void ble_send_buffer(unsigned char *data, unsigned int len) {
+	/* TODO: Track connection handles somehow. */
+	ble_hc_send_buffer(data, len, 0);
+}
+static void hc_send_buffer(unsigned char *data, unsigned int len) {
+	/* TODO: Track connection handles somehow. */
+	ble_hc_send_buffer(data, len, 1);
+}
 
-static void process_packet_ble(unsigned char *data, unsigned int len) {
+static void process_packet_ble_hc(unsigned char *data, unsigned int len) {
+	CRITICAL_REGION_ENTER();
 	if (data[0] == COMM_ERASE_NEW_APP ||
 			data[0] == COMM_WRITE_NEW_APP_DATA ||
 			data[0] == COMM_ERASE_NEW_APP_ALL_CAN ||
@@ -726,7 +739,6 @@ static void process_packet_ble(unsigned char *data, unsigned int len) {
 
 	m_no_sleep_cnt = 20;
 
-	CRITICAL_REGION_ENTER();
 	packet_send_packet(data, len, PACKET_VESC);
 	CRITICAL_REGION_EXIT();
 }
@@ -776,6 +788,8 @@ static void process_packet_vesc(unsigned char *data, unsigned int len) {
 	} else {
 		if (m_is_enabled) {
 			packet_send_packet(data, len, PACKET_BLE);
+			/* TODO: Maybe packet type filtering for HC? */
+			packet_send_packet(data, len, PACKET_HC);
 		}
 	}
 }
@@ -965,6 +979,7 @@ int main(void) {
 	app_timer_init();
 	nrf_pwr_mgmt_init();
 	ble_stack_init();
+	ble_conn_state_init(); /* TODO: Is this the correct call location? */
 	gap_params_init();
 	gatt_init();
 	services_init();
@@ -978,7 +993,8 @@ int main(void) {
 	(void)set_enabled;
 
 	packet_init(uart_send_buffer, process_packet_vesc, PACKET_VESC);
-	packet_init(ble_send_buffer, process_packet_ble, PACKET_BLE);
+	packet_init(ble_send_buffer, process_packet_ble_hc, PACKET_BLE);
+	packet_init(hc_send_buffer, process_packet_ble_hc, PACKET_HC);
 
 	app_timer_create(&m_packet_timer, APP_TIMER_MODE_REPEATED, packet_timer_handler);
 	app_timer_start(m_packet_timer, APP_TIMER_TICKS(1), NULL);
@@ -1016,7 +1032,7 @@ int main(void) {
 		__set_FPSCR(__get_FPSCR()  & ~(0x0000009F));
 		(void)__get_FPSCR();
 		NVIC_ClearPendingIRQ(FPU_IRQn);
-		
+
 		if (m_config.pin_set) {
 			nrf_ble_lesc_request_handler();
 		}
